@@ -1,14 +1,12 @@
 import { Duration } from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
-import { IVpc, SubnetType } from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
-import { Cluster } from "aws-cdk-lib/aws-ecs";
 import { FileSystem } from "aws-cdk-lib/aws-efs";
 import { Construct } from "constructs";
 
 export type EventStoreProps = {
   fileSystem: FileSystem;
-  vpc: IVpc;
+  vpc: ec2.IVpc;
 };
 
 export const EVENT_STORE_HTTP_PORT = 2113;
@@ -20,7 +18,7 @@ export class EventStoreConstruct extends Construct {
   constructor(scope: Construct, id: string, props: EventStoreProps) {
     super(scope, id);
 
-    const cluster = new Cluster(this, "EventStoreCluster", {
+    const cluster = new ecs.Cluster(this, "EventStoreCluster", {
       vpc: props.vpc,
       clusterName: "EventStoreCluster",
     });
@@ -40,6 +38,11 @@ export class EventStoreConstruct extends Construct {
       },
     };
 
+    const esVolumeCerts: ecs.Volume = {
+      name: "eventstore-volume-certs",
+      host: {},
+    };
+
     const taskDefinition: ecs.TaskDefinition = new ecs.FargateTaskDefinition(
       this,
       "EventStoreTask",
@@ -49,6 +52,18 @@ export class EventStoreConstruct extends Construct {
         family: "EventStore",
       }
     );
+
+    const genCertContainer = taskDefinition.addContainer("GenCertContainer", {
+      image: ecs.ContainerImage.fromRegistry("eventstore/es-gencert-cli:1.0.2"),
+      containerName: "EventStore-genCert",
+      user: "root",
+      entryPoint: ["bash"],
+      essential: false,
+      command: [
+        "-c",
+        "mkdir -p ./certs && cd /certs && es-gencert-cli create-ca && es-gencert-cli create-node -out ./node1 -dns-names localhost && find . -type f -print0 | xargs -0 chmod 666",
+      ],
+    });
 
     const esContainer = taskDefinition.addContainer("EventStoreContainer", {
       image: ecs.ContainerImage.fromRegistry(
@@ -79,8 +94,15 @@ export class EventStoreConstruct extends Construct {
         EVENTSTORE_ENABLE_EXTERNAL_TCP: "true",
         EVENTSTORE_ENABLE_ATOM_PUB_OVER_HTTP: "true",
         EVENTSTORE_LOG_CONSOLE_FORMAT: "Json",
-        EVENTSTORE_INSECURE: "true",
+        EVENTSTORE_TRUSTED_ROOT_CERTIFICATES_PATH: "/certs/ca",
+        EVENTSTORE_CERTIFICATE_FILE: "/certs/node1/node.crt",
+        EVENTSTORE_CERTIFICATE_PRIVATE_KEY_FILE: "/certs/node1/node.key",
       },
+    });
+
+    esContainer.addContainerDependencies({
+      container: genCertContainer,
+      condition: ecs.ContainerDependencyCondition.COMPLETE,
     });
 
     const fargateService = new ecs.FargateService(
@@ -90,13 +112,14 @@ export class EventStoreConstruct extends Construct {
         cluster,
         taskDefinition,
         platformVersion: ecs.FargatePlatformVersion.LATEST,
-        vpcSubnets: { subnetType: SubnetType.PUBLIC },
+        vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
         assignPublicIp: true,
       }
     );
 
     taskDefinition.addVolume(esVolumeLogs);
     taskDefinition.addVolume(esVolumeData);
+    taskDefinition.addVolume(esVolumeCerts);
 
     esContainer.addMountPoints({
       containerPath: "/var/log/eventstore",
@@ -107,6 +130,18 @@ export class EventStoreConstruct extends Construct {
     esContainer.addMountPoints({
       containerPath: "/var/lib/eventstore",
       sourceVolume: esVolumeData.name,
+      readOnly: false,
+    });
+
+    esContainer.addMountPoints({
+      containerPath: "/certs",
+      sourceVolume: esVolumeCerts.name,
+      readOnly: false,
+    });
+
+    genCertContainer.addMountPoints({
+      containerPath: "/certs",
+      sourceVolume: esVolumeCerts.name,
       readOnly: false,
     });
 
